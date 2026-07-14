@@ -1,39 +1,49 @@
 package com.dwinovo.bilibridge;
 
-import com.dwinovo.bilibridge.batch.DanmakuBatcher;
-import com.dwinovo.bilibridge.bili.BiliApi;
-import com.dwinovo.bilibridge.bili.BiliDanmakuClient;
-import com.dwinovo.bilibridge.bili.DanmakuMessage;
+import com.dwinovo.bilibridge.bind.BindingRegistry;
+import com.dwinovo.bilibridge.bind.BindingRouter;
 import com.dwinovo.bilibridge.config.BridgeConfig;
 import com.dwinovo.numen.entity.Companions;
 import com.dwinovo.numen.entity.NumenPlayer;
+import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 
-import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 
 /**
- * Wires the network side to the game side. The danmaku client produces on its own
- * threads into a bounded handoff queue (full → oldest dropped); every server tick
- * drains the queue into the batcher and, when a batch is ready, emits it to every
- * live companion through the numen-api event channel. The companion's own model
+ * Wires the network side to the game side under the "one companion serves one
+ * live room" model. The {@link BindingRegistry} pairs companion names with rooms
+ * and drives one {@link RoomConnection} per distinct bound room (binding IS
+ * connecting); every server tick each room drains its queue and, when a batch is
+ * ready, the {@link BindingRouter} picks which live bound companions receive it
+ * through the numen-api event channel. A bound companion that is absent gets the
+ * batch dropped, announced once per absence streak. The companion's own model
  * reads and reacts — this mod calls no LLM.
  */
 public final class BridgeRuntime {
 
-    private static final int QUEUE_CAPACITY = 200;
-
     private static final BridgeRuntime INSTANCE = new BridgeRuntime();
 
-    private final BiliApi api = new BiliApi();
-    private final BiliDanmakuClient client = new BiliDanmakuClient(api, this::enqueue);
-    private final DanmakuBatcher batcher = new DanmakuBatcher();
+    /** roomId → its shared connection. Server thread only. */
+    private final Map<Long, RoomConnection> rooms = new LinkedHashMap<>();
+    private final BindingRouter router = new BindingRouter();
+    private final BindingRegistry registry = new BindingRegistry(new BindingRegistry.RoomLifecycle() {
+        @Override
+        public void open(long roomId) {
+            rooms.computeIfAbsent(roomId, RoomConnection::new).start(BridgeConfig.get().sessdata);
+        }
 
-    /** Network → game handoff. Guarded by its own monitor; both sides touch it briefly. */
-    private final ArrayDeque<DanmakuMessage> queue = new ArrayDeque<>();
-    private long droppedOverflow;
-    private long batchesEmitted;
-    private boolean active;   // server thread only: connect requested and not yet disconnected
+        @Override
+        public void close(long roomId) {
+            RoomConnection room = rooms.remove(roomId);
+            if (room != null) room.stop();
+            router.forgetRoom(roomId);
+        }
+    });
 
     private BridgeRuntime() {}
 
@@ -41,119 +51,137 @@ public final class BridgeRuntime {
         return INSTANCE;
     }
 
+    public BindingRegistry registry() {
+        return registry;
+    }
+
     // ------------------------------------------------------------------
-    // network side
+    // bindings (server thread, driven by /bilibridge)
     // ------------------------------------------------------------------
 
-    private boolean queueIsEmpty() {
-        synchronized (queue) {
-            return queue.isEmpty();
+    /** Bind + persist + connect. Returns the name's previous room, or null. */
+    public Long bind(String name, long roomId) {
+        Long prev = registry.bind(name, roomId);
+        if (prev != null && prev != roomId) router.forget(prev, name);
+        persistBindings();
+        return prev;
+    }
+
+    /** Unbind + persist; the room disconnects when its last binding leaves. Null if unbound. */
+    public Long unbind(String name) {
+        Long prev = registry.unbind(name);
+        if (prev != null) {
+            router.forget(prev, name);
+            persistBindings();
         }
+        return prev;
     }
 
-    private void enqueue(DanmakuMessage msg) {
-        synchronized (queue) {
-            if (queue.size() >= QUEUE_CAPACITY) {
-                queue.pollFirst();   // full → drop the oldest, the newest is worth more
-                droppedOverflow++;
-            }
-            queue.addLast(msg);
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // game side (server thread)
-    // ------------------------------------------------------------------
-
-    /**
-     * Debug entry for {@code /bilibridge test}: one fake danmaku (uid 0, fixed username)
-     * dropped into the same handoff queue the network side feeds, so it runs the full
-     * batch → filter/aggregate → event pipeline without any connection.
-     */
-    public void injectTest(String text) {
-        enqueue(DanmakuMessage.danmaku(0, "测试观众", text, System.currentTimeMillis()));
-    }
-
-    /** Start streaming the configured room. Returns null on success, else a user-facing error. */
-    public String connect() {
+    private void persistBindings() {
         BridgeConfig cfg = BridgeConfig.get();
-        if (cfg.roomId <= 0) {
-            return "未配置直播间号：/bilibridge connect <房间号> 或编辑 config/numen-bilibili-bridge.json";
-        }
-        active = true;
-        client.start(cfg.roomId, cfg.sessdata);
-        return null;
+        cfg.bindings = registry.snapshot();
+        cfg.save();
     }
 
-    public void disconnect() {
-        active = false;
-        client.stop();
-        batcher.clear();
-        synchronized (queue) {
-            queue.clear();
-        }
+    /** Inject one test danmaku into the room's pipeline. False when the room has no connection. */
+    public boolean injectTest(long roomId, String text) {
+        RoomConnection room = rooms.get(roomId);
+        if (room == null) return false;
+        room.inject(text);
+        return true;
     }
 
     public String status() {
         BridgeConfig cfg = BridgeConfig.get();
-        int queued;
-        long dropped;
-        synchronized (queue) {
-            queued = queue.size();
-            dropped = droppedOverflow;
+        if (registry.isEmpty()) {
+            return "尚未绑定任何同伴。/bilibridge bind <同伴名> <房间号> 建立绑定后即自动连接直播间，"
+                    + "该房间的弹幕只送达这个同伴。";
         }
-        return "房间 " + (cfg.roomId > 0 ? cfg.roomId : "(未配置)")
-                + " | " + client.describe()
-                + " | 待发批次 " + batcher.pendingCount() + " 条 (queued=" + queued
-                + ", overflow_dropped=" + dropped + ", batches=" + batchesEmitted + ")"
-                + " | window=" + cfg.batchWindowSeconds + "s max=" + cfg.batchMaxCount
-                + " lines=" + cfg.maxLines + " peruser=" + cfg.perUserPerWindow
-                + " urgent=" + cfg.urgent
-                + " | 身份: " + (cfg.sessdata.isEmpty() ? "匿名（用户名打码）" : "已登录");
+        StringBuilder sb = new StringBuilder();
+        for (long roomId : registry.rooms()) {
+            RoomConnection room = rooms.get(roomId);
+            sb.append("房间 ").append(roomId)
+              .append(" ↔ 同伴 ").append(String.join("、", registry.namesFor(roomId)))
+              .append(" | ").append(room == null ? "未连接" : room.describe())
+              .append('\n');
+        }
+        sb.append("window=").append(cfg.batchWindowSeconds).append("s max=").append(cfg.batchMaxCount)
+          .append(" lines=").append(cfg.maxLines).append(" peruser=").append(cfg.perUserPerWindow)
+          .append(" urgent=").append(cfg.urgent)
+          .append(" | 身份: ").append(cfg.sessdata.isEmpty() ? "匿名（用户名打码）" : "已登录");
+        return sb.toString();
     }
+
+    // ------------------------------------------------------------------
+    // server lifecycle
+    // ------------------------------------------------------------------
 
     public void onServerStarted(MinecraftServer server) {
         BridgeConfig cfg = BridgeConfig.get();
-        if (cfg.autoConnect && cfg.roomId > 0) {
-            Constants.LOG.info("[bilibridge] autoConnect — connecting to room {}", cfg.roomId);
-            connect();
+        if (!cfg.bindings.isEmpty()) {
+            Constants.LOG.info("[bilibridge] {} binding(s) configured — connecting bound rooms", cfg.bindings.size());
         }
+        registry.resetFrom(cfg.bindings);
     }
 
     /** The world is going away; the network side must not outlive it. */
     public void onServerStopping() {
-        if (active) {
-            Constants.LOG.info("[bilibridge] server stopping — disconnecting");
+        if (!rooms.isEmpty()) {
+            Constants.LOG.info("[bilibridge] server stopping — disconnecting {} room(s)", rooms.size());
         }
-        disconnect();
+        registry.closeAll();
+        // Defensive: no room may outlive the world even if the table went out of sync.
+        rooms.values().forEach(RoomConnection::stop);
+        rooms.clear();
+        router.reset();
     }
 
-    /** Every server tick: drain the handoff queue, flush a due batch to the companions. */
+    /** Every server tick: per room, drain the handoff queue and route a due batch. */
     public void onServerTick(MinecraftServer server) {
-        // Injected test danmaku must flow even without a connection — only skip when idle AND empty.
-        if (!active && batcher.pendingCount() == 0 && queueIsEmpty()) return;
+        if (rooms.isEmpty()) return;
         long now = System.currentTimeMillis();
-        while (true) {
-            DanmakuMessage msg;
-            synchronized (queue) {
-                msg = queue.pollFirst();
-            }
-            if (msg == null) break;
-            batcher.add(msg, now);
+        List<NumenPlayer> live = null;
+        for (RoomConnection room : rooms.values()) {
+            String xml = room.poll(now);
+            if (xml == null) continue;
+            if (live == null) live = liveCompanions(server);
+            deliver(server, room, xml, live);
         }
-        String xml = batcher.poll(now);
-        if (xml == null) return;
-        boolean delivered = false;
+    }
+
+    private static List<NumenPlayer> liveCompanions(MinecraftServer server) {
+        List<NumenPlayer> live = new ArrayList<>();
         for (ServerPlayer p : server.getPlayerList().getPlayers()) {
-            if (p instanceof NumenPlayer companion) {
-                Companions.emitEvent(companion, xml, BridgeConfig.get().urgent);
-                delivered = true;
+            if (p instanceof NumenPlayer companion) live.add(companion);
+        }
+        return live;
+    }
+
+    private void deliver(MinecraftServer server, RoomConnection room, String xml, List<NumenPlayer> live) {
+        List<String> liveNames = new ArrayList<>(live.size());
+        for (NumenPlayer companion : live) liveNames.add(companion.getName().getString());
+        BindingRouter.Routing routing = router.route(room.roomId, registry.namesFor(room.roomId), liveNames);
+
+        boolean urgent = BridgeConfig.get().urgent;
+        boolean delivered = false;
+        for (String name : routing.deliverTo()) {
+            for (NumenPlayer companion : live) {
+                if (companion.getName().getString().equals(name)) {
+                    Companions.emitEvent(companion, xml, urgent);
+                    delivered = true;
+                }
             }
         }
         if (delivered) {
-            batchesEmitted++;
+            room.countEmitted();
         } else {
-            Constants.LOG.debug("[bilibridge] batch ready but no live companion — dropped");
+            Constants.LOG.debug("[bilibridge] room {} batch ready but no bound companion live — dropped",
+                    room.roomId);
+        }
+        for (String name : routing.newlyAbsent()) {
+            server.getPlayerList().broadcastSystemMessage(Component.literal(
+                    "[bilibridge] 绑定的同伴 " + name + " 不在场，房间 " + room.roomId
+                            + " 的本批弹幕已丢弃（它回来前不再重复提示）"), false);
         }
     }
 }

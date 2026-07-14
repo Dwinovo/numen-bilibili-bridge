@@ -8,6 +8,8 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 /**
  * Plain-JSON config at {@code config/numen-bilibili-bridge.json}. Loaded once at
@@ -23,8 +25,13 @@ public final class BridgeConfig {
     private static volatile BridgeConfig instance = new BridgeConfig();
     private static volatile Path file;
 
-    /** Live room id as typed in the browser URL — the short id is fine, the bridge resolves the real one. */
-    public volatile long roomId = 0;
+    /**
+     * 同伴名 → live room id (as typed in the browser URL — the short id is fine, the
+     * bridge resolves the real one). One companion serves one room; several names may
+     * share a room. Binding is connecting: every distinct room here is connected when
+     * a world starts. Mutated on the server thread only, replaced wholesale on change.
+     */
+    public volatile Map<String, Long> bindings = new LinkedHashMap<>();
     /**
      * Optional login cookie. Empty = anonymous connection: danmaku text arrives intact
      * but usernames are masked by the server and uids are 0. Filling it in yields real
@@ -41,8 +48,6 @@ public final class BridgeConfig {
     public volatile int perUserPerWindow = 1;
     /** urgent=true wakes an idle companion to react immediately; false rides the owner's next turn. */
     public volatile boolean urgent = true;
-    /** Reconnect to the configured room automatically when a world/server starts. */
-    public volatile boolean autoConnect = false;
 
     public static BridgeConfig get() {
         return instance;
