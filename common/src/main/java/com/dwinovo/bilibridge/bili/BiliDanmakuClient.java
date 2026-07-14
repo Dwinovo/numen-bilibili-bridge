@@ -25,17 +25,27 @@ import java.util.function.Consumer;
 
 /**
  * The danmaku WebSocket connection. Owns a single scheduler thread for all
- * lifecycle work (REST prelude, connect, heartbeat, reconnect); JDK WebSocket
- * listener callbacks do the frame reassembly and command parsing on the
- * HttpClient's threads (the listener contract serializes them). Parsed messages
- * are handed to the {@code sink} — still off-thread; the game side is bridged by
- * the runtime's bounded queue. Nothing in this class may touch game state.
+ * lifecycle work (REST prelude, connect, heartbeat, reconnect); each connection
+ * attempt gets its own {@link FrameListener}, whose callbacks do the frame
+ * reassembly and command parsing on the HttpClient's threads (the listener
+ * contract serializes them per socket). Parsed messages are handed to the
+ * {@code sink} — still off-thread; the game side is bridged by the runtime's
+ * bounded queue. Nothing in this class may touch game state.
+ *
+ * <p>Liveness: the server answers every 30-second heartbeat with a popularity
+ * reply, so a healthy connection is never silent for long. The heartbeat task
+ * doubles as a watchdog — when nothing inbound has arrived for
+ * {@link #INBOUND_SILENCE_LIMIT_MS} the connection is presumed dead (half-open
+ * TCP after sleep/network loss never fails locally on its own) and is torn down
+ * for a fresh prelude + reconnect instead of sitting in CONNECTED forever.
  */
-public final class BiliDanmakuClient implements WebSocket.Listener {
+public final class BiliDanmakuClient {
 
     public enum State { IDLE, CONNECTING, CONNECTED, RECONNECTING }
 
     private static final long HEARTBEAT_PERIOD_S = 30;   // 60 s of silence gets the client kicked
+    /** Two missed heartbeat replies + slack → the link is dead even if TCP hasn't noticed. */
+    private static final long INBOUND_SILENCE_LIMIT_MS = 75_000;
     private static final int MAX_BACKOFF_S = 30;
     /** This many failures in a row → the cached token/host list is stale, redo the REST prelude. */
     private static final int FAILURES_BEFORE_REFRESH = 3;
@@ -62,9 +72,6 @@ public final class BiliDanmakuClient implements WebSocket.Listener {
     private ScheduledFuture<?> heartbeatTask;
     private CompletableFuture<WebSocket> sendChain = CompletableFuture.completedFuture(null);
 
-    // ---- frame reassembly: touched only in listener callbacks (serialized by contract) ----
-    private final ByteArrayOutputStream partial = new ByteArrayOutputStream();
-
     // ---- observability: read from the game thread by /bilibridge status ----
     private volatile State state = State.IDLE;
     private volatile String statusDetail = "";
@@ -73,7 +80,14 @@ public final class BiliDanmakuClient implements WebSocket.Listener {
     private final AtomicLong danmakuCount = new AtomicLong();
     private final AtomicLong superChatCount = new AtomicLong();
     private volatile long lastMessageAtMs;
+    /** Bumped by EVERY inbound listener callback; the heartbeat watchdog reads it. */
+    private volatile long lastInboundAtMs;
+    /** From the latest heartbeat reply — visible proof the downstream is alive. */
+    private volatile int popularity;
     private boolean warnedBrotli;
+
+    /** Diagnostics hook (e.g. the manual smoke tool): sees every command's {@code cmd} name. Network thread! */
+    volatile Consumer<String> commandObserver;
 
     public BiliDanmakuClient(BiliApi api, Consumer<DanmakuMessage> sink) {
         this.api = api;
@@ -118,7 +132,8 @@ public final class BiliDanmakuClient implements WebSocket.Listener {
         State s = state;
         StringBuilder sb = new StringBuilder(s.name());
         if (s == State.CONNECTED) {
-            sb.append(" room=").append(connectedRoomId).append(" host=").append(connectedHost);
+            sb.append(" room=").append(connectedRoomId).append(" host=").append(connectedHost)
+              .append(" popularity=").append(popularity);
         } else if (!statusDetail.isEmpty()) {
             sb.append(" (").append(statusDetail).append(')');
         }
@@ -127,6 +142,10 @@ public final class BiliDanmakuClient implements WebSocket.Listener {
         long last = lastMessageAtMs;
         if (last > 0) {
             sb.append(" last=").append((System.currentTimeMillis() - last) / 1000).append("s ago");
+        }
+        long inbound = lastInboundAtMs;
+        if (s == State.CONNECTED && inbound > 0) {
+            sb.append(" inbound=").append((System.currentTimeMillis() - inbound) / 1000).append("s ago");
         }
         return sb.toString();
     }
@@ -137,6 +156,18 @@ public final class BiliDanmakuClient implements WebSocket.Listener {
 
     private void connectNow(long gen) {
         if (!running || gen != generation) return;
+        try {
+            connectNowInner(gen);
+        } catch (Throwable t) {
+            // The exec is a ScheduledThreadPoolExecutor: execute()/schedule() wrap tasks
+            // as futures, so anything uncaught here would be swallowed SILENTLY and the
+            // client would freeze in its current state forever. Surface it and retry.
+            Constants.LOG.warn("[bilibridge] connect attempt blew up: {}", t.toString(), t);
+            scheduleReconnect(gen, "internal: " + t);
+        }
+    }
+
+    private void connectNowInner(long gen) {
         try {
             if (info == null) {
                 info = api.prepare(roomId);
@@ -155,7 +186,7 @@ public final class BiliDanmakuClient implements WebSocket.Listener {
         Constants.LOG.info("[bilibridge] connecting to room {} via {}", info.realRoomId(), host.host());
         wsHttp.newWebSocketBuilder()
                 .connectTimeout(Duration.ofSeconds(10))
-                .buildAsync(uri, this)
+                .buildAsync(uri, newListener(gen))
                 .whenCompleteAsync((socket, err) -> {
                     if (!running || gen != generation) {
                         if (socket != null) socket.abort();
@@ -211,8 +242,24 @@ public final class BiliDanmakuClient implements WebSocket.Listener {
         cancelHeartbeat();
         long gen = generation;
         heartbeatTask = exec.scheduleAtFixedRate(() -> {
-            if (!running || gen != generation || ws == null) return;
-            send(ws, BiliPacket.encode(BiliPacket.VER_HEARTBEAT, BiliPacket.OP_HEARTBEAT, "[object Object]"));
+            // An uncaught throwable would silently cancel every future run of a
+            // scheduleAtFixedRate task — catch everything, the watchdog must not die.
+            try {
+                if (!running || gen != generation || ws == null) return;
+                long silentMs = System.currentTimeMillis() - lastInboundAtMs;
+                if (silentMs > INBOUND_SILENCE_LIMIT_MS) {
+                    // Half-open TCP (sleep, network switch) never fails locally on its own:
+                    // without this check the client would sit in CONNECTED forever receiving nothing.
+                    Constants.LOG.warn("[bilibridge] no inbound frame for {}s — connection presumed dead, reconnecting",
+                            silentMs / 1000);
+                    info = null;                         // the token is minutes-lived; a dead spell outlives it
+                    scheduleReconnect(gen, "silent " + silentMs / 1000 + "s");
+                    return;
+                }
+                send(ws, BiliPacket.encode(BiliPacket.VER_HEARTBEAT, BiliPacket.OP_HEARTBEAT, "[object Object]"));
+            } catch (Throwable t) {
+                Constants.LOG.warn("[bilibridge] heartbeat task blew up: {}", t.toString(), t);
+            }
         }, 0, HEARTBEAT_PERIOD_S, TimeUnit.SECONDS);
     }
 
@@ -223,12 +270,20 @@ public final class BiliDanmakuClient implements WebSocket.Listener {
         }
     }
 
-    /** JDK WebSocket rejects overlapping sends — chain them so each waits for the previous. */
-    private synchronized void send(WebSocket socket, ByteBuffer data) {
+    /**
+     * All sends happen on the exec thread; the JDK WebSocket rejects overlapping
+     * sends, so each is chained onto the previous one. A failed send is a hard
+     * signal the connection is gone — reconnect instead of whispering into a void.
+     */
+    private void send(WebSocket socket, ByteBuffer data) {
+        long gen = generation;
         sendChain = sendChain
                 .thenCompose(w -> socket.sendBinary(data, true))
                 .exceptionally(e -> {
-                    Constants.LOG.debug("[bilibridge] send failed: {}", e.toString());
+                    Constants.LOG.warn("[bilibridge] send failed: {}", e.toString());
+                    exec.execute(() -> {
+                        if (running && gen == generation) scheduleReconnect(gen, "send: " + e.getMessage());
+                    });
                     return socket;
                 });
     }
@@ -238,100 +293,151 @@ public final class BiliDanmakuClient implements WebSocket.Listener {
         statusDetail = detail;
     }
 
+    /** One listener per connection attempt; also the seam the regression tests drive. */
+    WebSocket.Listener newListener(long gen) {
+        return new FrameListener(gen);
+    }
+
     // ------------------------------------------------------------------
     // WebSocket.Listener (HttpClient threads — hand lifecycle back to exec)
     // ------------------------------------------------------------------
 
-    @Override
-    public void onOpen(WebSocket webSocket) {
-        webSocket.request(1);
-    }
+    /**
+     * The receive side of ONE connection attempt. A fresh instance per attempt
+     * keeps the reassembly buffer from ever mixing bytes of two sockets, and the
+     * captured generation keeps a stale socket's callbacks from touching current
+     * lifecycle state.
+     *
+     * <p>JDK {@code WebSocket} delivers exactly as many callback invocations as
+     * were {@code request}ed; a single missed re-request starves the connection
+     * silently and forever. Rule enforced here: EVERY callback path — partial or
+     * final fragment, text, ping, pong, even a parse failure — re-requests
+     * exactly once, in {@code finally} so no throwable can skip it.
+     */
+    private final class FrameListener implements WebSocket.Listener {
 
-    @Override
-    public CompletionStage<?> onBinary(WebSocket webSocket, ByteBuffer data, boolean last) {
-        // The JDK delivers partial messages: accumulate until last==true, then parse.
-        byte[] chunk = new byte[data.remaining()];
-        data.get(chunk);
-        partial.write(chunk, 0, chunk.length);
-        if (last) {
-            byte[] whole = partial.toByteArray();
-            partial.reset();
+        private final long gen;
+        /** Reassembly buffer: the JDK delivers partial messages; parse only at {@code last}. */
+        private final ByteArrayOutputStream partial = new ByteArrayOutputStream();
+
+        FrameListener(long gen) {
+            this.gen = gen;
+        }
+
+        @Override
+        public void onOpen(WebSocket webSocket) {
+            lastInboundAtMs = System.currentTimeMillis();
+            webSocket.request(1);
+        }
+
+        @Override
+        public CompletionStage<?> onBinary(WebSocket webSocket, ByteBuffer data, boolean last) {
+            lastInboundAtMs = System.currentTimeMillis();
             try {
-                handleFrames(BiliPacket.decode(whole));
-            } catch (Exception e) {
-                Constants.LOG.warn("[bilibridge] frame handling error: {}", e.toString());
+                byte[] chunk = new byte[data.remaining()];
+                data.get(chunk);
+                partial.write(chunk, 0, chunk.length);
+                if (last) {
+                    byte[] whole = partial.toByteArray();
+                    partial.reset();
+                    handleFrames(BiliPacket.decode(whole));
+                }
+            } catch (Throwable t) {
+                Constants.LOG.warn("[bilibridge] frame handling error: {}", t.toString());
+            } finally {
+                webSocket.request(1);
             }
+            return null;
         }
-        webSocket.request(1);
-        return null;
-    }
 
-    @Override
-    public CompletionStage<?> onClose(WebSocket webSocket, int statusCode, String reason) {
-        exec.execute(() -> {
-            if (ws == webSocket) {
+        @Override
+        public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
+            lastInboundAtMs = System.currentTimeMillis();  // the protocol is binary-only; count it, drop it
+            webSocket.request(1);
+            return null;
+        }
+
+        @Override
+        public CompletionStage<?> onPing(WebSocket webSocket, ByteBuffer message) {
+            lastInboundAtMs = System.currentTimeMillis();
+            webSocket.request(1);
+            return null;
+        }
+
+        @Override
+        public CompletionStage<?> onPong(WebSocket webSocket, ByteBuffer message) {
+            lastInboundAtMs = System.currentTimeMillis();
+            webSocket.request(1);
+            return null;
+        }
+
+        @Override
+        public CompletionStage<?> onClose(WebSocket webSocket, int statusCode, String reason) {
+            exec.execute(() -> {
+                if (!running || gen != generation) return;
                 Constants.LOG.warn("[bilibridge] connection closed ({} {})", statusCode, reason);
-                scheduleReconnect(generation, "closed " + statusCode);
-            }
-        });
-        return null;
-    }
+                scheduleReconnect(gen, "closed " + statusCode);
+            });
+            return null;
+        }
 
-    @Override
-    public void onError(WebSocket webSocket, Throwable error) {
-        exec.execute(() -> {
-            if (ws == webSocket) {
+        @Override
+        public void onError(WebSocket webSocket, Throwable error) {
+            exec.execute(() -> {
+                if (!running || gen != generation) return;
                 Constants.LOG.warn("[bilibridge] connection error: {}", error.toString());
-                scheduleReconnect(generation, "error: " + error.getMessage());
-            }
-        });
-    }
+                scheduleReconnect(gen, "error: " + error.getMessage());
+            });
+        }
 
-    // ------------------------------------------------------------------
-    // frame + command handling (listener thread)
-    // ------------------------------------------------------------------
+        // ------------------------------------------------------------------
+        // frame + command handling (listener thread)
+        // ------------------------------------------------------------------
 
-    private void handleFrames(List<BiliPacket.Frame> frames) throws Exception {
-        for (BiliPacket.Frame frame : frames) {
-            switch (frame.operation()) {
-                case BiliPacket.OP_AUTH_REPLY -> {
-                    JsonObject reply = JsonParser.parseString(
-                            new String(frame.body(), StandardCharsets.UTF_8)).getAsJsonObject();
-                    int code = reply.has("code") ? reply.get("code").getAsInt() : -1;
-                    exec.execute(() -> {
-                        if (!running) return;
-                        if (code == 0) {
-                            onAuthenticated();
-                        } else {
-                            Constants.LOG.warn("[bilibridge] auth rejected, code {}", code);
-                            info = null;   // token burned — redo the prelude
-                            scheduleReconnect(generation, "auth code " + code);
+        private void handleFrames(List<BiliPacket.Frame> frames) throws Exception {
+            for (BiliPacket.Frame frame : frames) {
+                switch (frame.operation()) {
+                    case BiliPacket.OP_AUTH_REPLY -> {
+                        JsonObject reply = JsonParser.parseString(
+                                new String(frame.body(), StandardCharsets.UTF_8)).getAsJsonObject();
+                        int code = reply.has("code") ? reply.get("code").getAsInt() : -1;
+                        exec.execute(() -> {
+                            if (!running || gen != generation) return;
+                            if (code == 0) {
+                                onAuthenticated();
+                            } else {
+                                Constants.LOG.warn("[bilibridge] auth rejected, code {}", code);
+                                info = null;   // token burned — redo the prelude
+                                scheduleReconnect(gen, "auth code " + code);
+                            }
+                        });
+                    }
+                    case BiliPacket.OP_HEARTBEAT_REPLY -> {
+                        if (frame.body().length >= 4) {
+                            popularity = ByteBuffer.wrap(frame.body()).getInt();
                         }
-                    });
+                    }
+                    case BiliPacket.OP_COMMAND -> handleCommandFrame(frame);
+                    default -> { /* ignore */ }
                 }
-                case BiliPacket.OP_HEARTBEAT_REPLY -> {
-                    // First 4 bytes are the room's popularity value; nothing to do with it.
-                }
-                case BiliPacket.OP_COMMAND -> handleCommandFrame(frame);
-                default -> { /* ignore */ }
             }
         }
-    }
 
-    private void handleCommandFrame(BiliPacket.Frame frame) throws Exception {
-        switch (frame.version()) {
-            case BiliPacket.VER_ZLIB ->
-                    // zlib body inflates to a packet CONCATENATION — recurse through the decoder.
-                    handleFrames(BiliPacket.decode(BiliPacket.inflate(frame.body())));
-            case BiliPacket.VER_PLAIN ->
-                    handleCommand(new String(frame.body(), StandardCharsets.UTF_8));
-            case BiliPacket.VER_BROTLI -> {
-                if (!warnedBrotli) {
-                    warnedBrotli = true;
-                    Constants.LOG.warn("[bilibridge] server sent a brotli frame despite protover 2 — dropping");
+        private void handleCommandFrame(BiliPacket.Frame frame) throws Exception {
+            switch (frame.version()) {
+                case BiliPacket.VER_ZLIB ->
+                        // zlib body inflates to a packet CONCATENATION — recurse through the decoder.
+                        handleFrames(BiliPacket.decode(BiliPacket.inflate(frame.body())));
+                case BiliPacket.VER_PLAIN ->
+                        handleCommand(new String(frame.body(), StandardCharsets.UTF_8));
+                case BiliPacket.VER_BROTLI -> {
+                    if (!warnedBrotli) {
+                        warnedBrotli = true;
+                        Constants.LOG.warn("[bilibridge] server sent a brotli frame despite protover 2 — dropping");
+                    }
                 }
+                default -> Constants.LOG.debug("[bilibridge] command frame with unknown version {}", frame.version());
             }
-            default -> Constants.LOG.debug("[bilibridge] command frame with unknown version {}", frame.version());
         }
     }
 
@@ -339,6 +445,8 @@ public final class BiliDanmakuClient implements WebSocket.Listener {
         try {
             JsonObject obj = JsonParser.parseString(json).getAsJsonObject();
             String cmd = obj.has("cmd") ? obj.get("cmd").getAsString() : "";
+            Consumer<String> observer = commandObserver;
+            if (observer != null) observer.accept(cmd);
             // Some commands arrive with a suffix, e.g. "DANMU_MSG:4:0:2:2:2:0" — match by prefix.
             if (cmd.startsWith("DANMU_MSG")) {
                 handleDanmu(obj);
