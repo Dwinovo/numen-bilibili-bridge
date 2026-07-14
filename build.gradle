@@ -1,0 +1,8 @@
+plugins {
+    // see https://fabricmc.net/develop/ for new versions
+    // 1.21.1 is an obfuscated MC version → use the -remap loom variant. Same 1.14.x line
+    // as numen core on this branch.
+    id 'net.fabricmc.fabric-loom-remap' version '1.14.10' apply false
+    // see https://projects.neoforged.net/neoforged/moddevgradle for new versions
+    id 'net.neoforged.moddev' version '2.0.141' apply false
+}

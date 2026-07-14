@@ -1,0 +1,35 @@
+# eclipse
+bin
+*.launch
+.settings
+.metadata
+.classpath
+.project
+
+# idea
+out
+*.ipr
+*.iws
+*.iml
+.idea/*
+
+# vscode
+.vscode/
+
+# gradle
+build
+.gradle
+
+# other
+eclipse
+run
+runs
+logs
+
+# Claude local tooling — not mod source
+.claude/
+
+# credentials never touch VCS
+.env
+**/.env
+!**/.env.example
