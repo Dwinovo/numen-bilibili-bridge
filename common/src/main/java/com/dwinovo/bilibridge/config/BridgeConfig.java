@@ -32,9 +32,13 @@ public final class BridgeConfig {
      */
     public volatile String sessdata = "";
     /** A batch flushes when this many seconds have passed since its first message… */
-    public volatile int batchWindowSeconds = 5;
-    /** …or when it holds this many messages, whichever comes first. */
-    public volatile int batchMaxCount = 30;
+    public volatile int batchWindowSeconds = 15;
+    /** …or when it holds this many raw messages (before filtering), whichever comes first. */
+    public volatile int batchMaxCount = 50;
+    /** After filtering and aggregation, at most this many ordinary danmaku lines per batch — newest win. */
+    public volatile int maxLines = 20;
+    /** Per user per window, keep only the newest N danmaku; 0 disables. Super Chats are exempt. */
+    public volatile int perUserPerWindow = 1;
     /** urgent=true wakes an idle companion to react immediately; false rides the owner's next turn. */
     public volatile boolean urgent = true;
     /** Reconnect to the configured room automatically when a world/server starts. */

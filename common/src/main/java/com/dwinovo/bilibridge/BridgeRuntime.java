@@ -45,6 +45,12 @@ public final class BridgeRuntime {
     // network side
     // ------------------------------------------------------------------
 
+    private boolean queueIsEmpty() {
+        synchronized (queue) {
+            return queue.isEmpty();
+        }
+    }
+
     private void enqueue(DanmakuMessage msg) {
         synchronized (queue) {
             if (queue.size() >= QUEUE_CAPACITY) {
@@ -58,6 +64,15 @@ public final class BridgeRuntime {
     // ------------------------------------------------------------------
     // game side (server thread)
     // ------------------------------------------------------------------
+
+    /**
+     * Debug entry for {@code /bilibridge test}: one fake danmaku (uid 0, fixed username)
+     * dropped into the same handoff queue the network side feeds, so it runs the full
+     * batch → filter/aggregate → event pipeline without any connection.
+     */
+    public void injectTest(String text) {
+        enqueue(DanmakuMessage.danmaku(0, "测试观众", text, System.currentTimeMillis()));
+    }
 
     /** Start streaming the configured room. Returns null on success, else a user-facing error. */
     public String connect() {
@@ -92,6 +107,7 @@ public final class BridgeRuntime {
                 + " | 待发批次 " + batcher.pendingCount() + " 条 (queued=" + queued
                 + ", overflow_dropped=" + dropped + ", batches=" + batchesEmitted + ")"
                 + " | window=" + cfg.batchWindowSeconds + "s max=" + cfg.batchMaxCount
+                + " lines=" + cfg.maxLines + " peruser=" + cfg.perUserPerWindow
                 + " urgent=" + cfg.urgent
                 + " | 身份: " + (cfg.sessdata.isEmpty() ? "匿名（用户名打码）" : "已登录");
     }
@@ -114,7 +130,8 @@ public final class BridgeRuntime {
 
     /** Every server tick: drain the handoff queue, flush a due batch to the companions. */
     public void onServerTick(MinecraftServer server) {
-        if (!active) return;
+        // Injected test danmaku must flow even without a connection — only skip when idle AND empty.
+        if (!active && batcher.pendingCount() == 0 && queueIsEmpty()) return;
         long now = System.currentTimeMillis();
         while (true) {
             DanmakuMessage msg;
